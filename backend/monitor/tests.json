@@ -1,0 +1,12 @@
+{
+  "tests": [
+    {
+      "name": "GET monitor scan",
+      "method": "GET",
+      "path": "/",
+      "expectedStatus": 200,
+      "expectedBody": {"new_count": 0, "recent": []},
+      "bodyMatcher": "partial"
+    }
+  ]
+}
