@@ -4,7 +4,7 @@ import Icon from "@/components/ui/icon";
 
 const WISHLIST_URL = "https://functions.poehali.dev/7cf7ec09-48e6-4e8a-96ce-51f2c7bea976";
 const MONITOR_URL = "https://functions.poehali.dev/c4343edc-0856-40d6-81b0-122dd4fc72e4";
-const SCAN_INTERVAL = 20000;
+const SCAN_INTERVAL = 5000; // 5 секунд — быстрое обновление
 
 interface WishlistItem {
   id: number;
@@ -43,7 +43,9 @@ export default function Index() {
   const [recentLots, setRecentLots] = useState<FoundLot[]>([]);
   const [alerts, setAlerts] = useState<FoundLot[]>([]);
   const [autoScan, setAutoScan] = useState(false);
+  const [nextScanIn, setNextScanIn] = useState(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [catSearch, setCatSearch] = useState("");
   const [activeCategory, setActiveCategory] = useState("Все");
@@ -86,6 +88,13 @@ export default function Index() {
     loadWishlist();
   };
 
+  // Запрашиваем разрешение на браузерные уведомления
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  }, []);
+
   const runScan = useCallback(async () => {
     setScanning(true);
     try {
@@ -93,7 +102,41 @@ export default function Index() {
       const data = await res.json();
       setRecentLots(data.recent || []);
       if (data.new_finds && data.new_finds.length > 0) {
-        setAlerts(prev => [...data.new_finds, ...prev].slice(0, 20));
+        const newFinds: FoundLot[] = data.new_finds;
+        setAlerts(prev => [...newFinds, ...prev].slice(0, 20));
+
+        // Браузерное уведомление для каждого нового лота
+        newFinds.forEach((lot: FoundLot) => {
+          // Web Notification API
+          if ("Notification" in window && Notification.permission === "granted") {
+            const notif = new Notification(`🟢 ${lot.wishlist_name} — найдено!`, {
+              body: `${lot.title}\n${lot.price.toLocaleString("ru-RU")} $ (лимит: ${lot.max_price.toLocaleString("ru-RU")} $)`,
+              icon: "/favicon.svg",
+              tag: `lot-${lot.id}`,
+            });
+            // Клик по уведомлению — открыть ссылку
+            notif.onclick = () => {
+              window.open(lot.url, "_blank");
+              notif.close();
+            };
+            // Авто-закрытие через 8 секунд
+            setTimeout(() => notif.close(), 8000);
+          }
+        });
+
+        // Звуковой сигнал (если разрешён)
+        try {
+          const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.frequency.value = 880;
+          gain.gain.setValueAtTime(0.3, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+          osc.start(ctx.currentTime);
+          osc.stop(ctx.currentTime + 0.4);
+        } catch (_e) { /* звук не поддерживается */ }
       }
       setLastScan(new Date());
     } finally {
@@ -104,11 +147,24 @@ export default function Index() {
   useEffect(() => {
     if (autoScan) {
       runScan();
-      intervalRef.current = setInterval(runScan, SCAN_INTERVAL);
+      setNextScanIn(SCAN_INTERVAL / 1000);
+      intervalRef.current = setInterval(() => {
+        runScan();
+        setNextScanIn(SCAN_INTERVAL / 1000);
+      }, SCAN_INTERVAL);
+      // Обратный отсчёт
+      countdownRef.current = setInterval(() => {
+        setNextScanIn(prev => Math.max(0, prev - 1));
+      }, 1000);
     } else {
       if (intervalRef.current) clearInterval(intervalRef.current);
+      if (countdownRef.current) clearInterval(countdownRef.current);
+      setNextScanIn(0);
     }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (countdownRef.current) clearInterval(countdownRef.current);
+    };
   }, [autoScan, runScan]);
 
   const dismissAlert = (id: number) => setAlerts(prev => prev.filter(a => a.id !== id));
@@ -213,7 +269,11 @@ export default function Index() {
               <div>
                 <p className="text-[13px] font-semibold text-white">Автосканирование 5vito</p>
                 <p className="text-[11px] text-[#333] mt-0.5">
-                  {activeCount} поз. · каждые {SCAN_INTERVAL / 1000} сек · уведомление при находке
+                  {activeCount} поз. · каждые {SCAN_INTERVAL / 1000} сек
+                  {autoScan && nextScanIn > 0 && (
+                    <span className="text-[#22c55e]/60 ml-1">· следующий через {nextScanIn}с</span>
+                  )}
+                  {!autoScan && <span className="ml-1">· уведомление при находке</span>}
                 </p>
               </div>
               <div className="flex items-center gap-2">

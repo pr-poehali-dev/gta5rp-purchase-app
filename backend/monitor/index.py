@@ -8,84 +8,277 @@ import re
 import psycopg2
 import urllib.request
 import urllib.parse
+import ssl
 
 SCHEMA = "t_p53611971_gta5rp_purchase_app"
 BASE_URL = "https://5vito.ru"
 
+# SSL контекст без проверки сертификата (для совместимости)
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
 def get_conn():
     return psycopg2.connect(os.environ["DATABASE_URL"])
+
+def fetch_html(url: str) -> str:
+    """Загружает HTML страницы с корректными заголовками браузера."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Cache-Control": "max-age=0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as resp:
+        raw = resp.read()
+        # Определяем кодировку
+        content_type = resp.headers.get("Content-Type", "")
+        encoding = "utf-8"
+        if "charset=" in content_type:
+            encoding = content_type.split("charset=")[-1].strip()
+        return raw.decode(encoding, errors="ignore")
 
 def fetch_listings(search_query: str) -> list:
     """Парсит страницу поиска 5vito и возвращает найденные объявления."""
     try:
         encoded = urllib.parse.quote(search_query)
         url = f"{BASE_URL}/search?q={encoded}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        return parse_html(html, search_query)
+        html = fetch_html(url)
+        lots = parse_html(html, search_query)
+        # Если поиск вернул мало — попробуем страницу каталога
+        if len(lots) < 2:
+            url2 = f"{BASE_URL}/catalog?search={encoded}"
+            html2 = fetch_html(url2)
+            lots2 = parse_html(html2, search_query)
+            # Объединяем, убирая дубли по url
+            seen = {l["url"] for l in lots}
+            for l in lots2:
+                if l["url"] not in seen:
+                    lots.append(l)
+                    seen.add(l["url"])
+        return lots[:15]
     except Exception as e:
+        print(f"[fetch_listings] error for '{search_query}': {e}")
         return []
 
 def parse_html(html: str, query: str) -> list:
-    """Извлекает лоты из HTML страницы 5vito."""
+    """
+    Извлекает лоты из HTML страницы 5vito.
+    Использует несколько стратегий парсинга для максимальной надёжности.
+    """
     lots = []
+    query_lower = query.lower()
 
-    # Паттерны для извлечения карточек объявлений 5vito
-    card_pattern = re.compile(
-        r'href="(/(?:items|product|lot|ad)/[^"]+)"[^>]*>.*?'
-        r'(?:<img[^>]+src="([^"]*)"[^>]*>)?.*?'
-        r'([\w\s\-\.]+?)(?:\s*<).*?'
-        r'([\d\s]+)\s*(?:\$|₽)',
-        re.DOTALL | re.IGNORECASE,
-    )
+    # --- Стратегия 1: JSON-like данные в скриптах (Next.js / Nuxt hydration) ---
+    json_lots = _parse_json_data(html, query_lower)
+    lots.extend(json_lots)
 
-    # Более простой паттерн — ищем цены рядом с названиями
-    price_pattern = re.compile(r'([\d][\d\s]{2,})\s*(?:\$|₽|\$)', re.IGNORECASE)
-    title_pattern = re.compile(
-        r'<(?:h[1-6]|span|div)[^>]*class="[^"]*(?:title|name|item)[^"]*"[^>]*>\s*([^<]{3,60})\s*<',
-        re.IGNORECASE,
-    )
-    link_pattern = re.compile(r'href="(/(?:items?|products?|lots?|ads?|p)/[^"?#]{3,})"', re.IGNORECASE)
-    img_pattern = re.compile(r'<img[^>]+src="(https?://[^"]+(?:jpg|png|webp)[^"]*)"', re.IGNORECASE)
+    # --- Стратегия 2: Парсинг HTML карточек ---
+    if len(lots) < 3:
+        html_lots = _parse_html_cards(html, query_lower)
+        seen_urls = {l["url"] for l in lots}
+        for l in html_lots:
+            if l["url"] not in seen_urls:
+                lots.append(l)
+                seen_urls.add(l["url"])
 
-    titles = title_pattern.findall(html)
-    links = link_pattern.findall(html)
-    prices_raw = price_pattern.findall(html)
-    images = img_pattern.findall(html)
+    # --- Стратегия 3: Общий паттерн цена + ссылка ---
+    if len(lots) < 2:
+        fallback_lots = _parse_fallback(html, query_lower)
+        seen_urls = {l["url"] for l in lots}
+        for l in fallback_lots:
+            if l["url"] not in seen_urls:
+                lots.append(l)
+                seen_urls.add(l["url"])
 
-    prices = []
-    for p in prices_raw:
-        cleaned = re.sub(r'\s+', '', p)
+    return lots[:15]
+
+def _clean_text(text: str) -> str:
+    """Очищает текст от HTML тегов и лишних пробелов."""
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'&nbsp;', ' ', text)
+    text = re.sub(r'&amp;', '&', text)
+    text = re.sub(r'&lt;', '<', text)
+    text = re.sub(r'&gt;', '>', text)
+    text = re.sub(r'&quot;', '"', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def _parse_price(text: str) -> int:
+    """Извлекает число из строки с ценой."""
+    cleaned = re.sub(r'[^\d]', '', text)
+    if cleaned and len(cleaned) <= 12:
         try:
-            prices.append(int(cleaned))
+            return int(cleaned)
         except Exception:
             pass
+    return 0
 
-    query_lower = query.lower()
-    for i, title in enumerate(titles[:20]):
-        title_clean = title.strip()
-        if query_lower not in title_clean.lower():
-            continue
-        link = (BASE_URL + links[i]) if i < len(links) else BASE_URL
-        price = prices[i] if i < len(prices) else 0
-        image = images[i] if i < len(images) else None
-        if price > 0:
+def _parse_json_data(html: str, query_lower: str) -> list:
+    """Ищет JSON данные о товарах внутри HTML (SSR данные)."""
+    lots = []
+    # Паттерны для JSON в script тегах
+    patterns = [
+        r'"title"\s*:\s*"([^"]{3,80})"[^}]*?"price"\s*:\s*(\d+)[^}]*?"(?:url|link|href|slug)"\s*:\s*"([^"]{3,200})"',
+        r'"name"\s*:\s*"([^"]{3,80})"[^}]*?"price"\s*:\s*(\d+)[^}]*?"(?:url|link|href|slug)"\s*:\s*"([^"]{3,200})"',
+        r'"(?:title|name)"\s*:\s*"([^"]{3,80})".*?"price"\s*:\s*(\d+)',
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            if len(match) >= 2:
+                title = match[0].strip()
+                try:
+                    price = int(match[1])
+                except Exception:
+                    continue
+                url_part = match[2] if len(match) > 2 else ""
+                if query_lower not in title.lower():
+                    continue
+                if price <= 0 or price > 100_000_000:
+                    continue
+                full_url = url_part if url_part.startswith("http") else (BASE_URL + "/" + url_part.lstrip("/"))
+                lots.append({
+                    "title": title,
+                    "price": price,
+                    "url": full_url,
+                    "image": None,
+                })
+        if lots:
+            break
+    
+    return lots[:10]
+
+def _parse_html_cards(html: str, query_lower: str) -> list:
+    """Парсит HTML карточки объявлений."""
+    lots = []
+    
+    # Паттерны CSS-классов для типичных маркетплейсов
+    card_patterns = [
+        # Обёртка карточки с href
+        r'<a[^>]+href="(/[^"]{3,150})"[^>]*>(.*?)</a>',
+        # div/article с data атрибутами
+        r'<(?:article|div|li)[^>]*class="[^"]*(?:card|item|lot|product|listing)[^"]*"[^>]*>(.*?)</(?:article|div|li)>',
+    ]
+    
+    # Ищем карточки
+    for card_pat in card_patterns:
+        cards = re.findall(card_pat, html, re.DOTALL | re.IGNORECASE)
+        for card in cards:
+            if isinstance(card, tuple):
+                href = card[0] if card[0].startswith('/') else None
+                content = card[1] if len(card) > 1 else card[0]
+            else:
+                href = None
+                content = card
+            
+            # Извлекаем текст для поиска
+            text = _clean_text(content)
+            if query_lower not in text.lower():
+                continue
+            
+            # Цена — ищем число рядом с ₽ или $
+            price_match = re.search(r'([\d][\d\s]{1,10}[\d])\s*(?:₽|\$|руб)', content, re.IGNORECASE)
+            if not price_match:
+                price_match = re.search(r'(?:price|цена)["\s:>]+(\d[\d\s]{1,8}\d)', content, re.IGNORECASE)
+            if not price_match:
+                continue
+            price = _parse_price(price_match.group(1))
+            if price <= 0 or price > 100_000_000:
+                continue
+            
+            # URL
+            if not href:
+                link_match = re.search(r'href="(/[^"]{3,150})"', content, re.IGNORECASE)
+                href = link_match.group(1) if link_match else None
+            if not href:
+                continue
+            full_url = BASE_URL + href if href.startswith('/') else href
+            
+            # Заголовок
+            title_match = re.search(
+                r'<(?:h[1-6]|span|div|p)[^>]*class="[^"]*(?:title|name|heading|caption)[^"]*"[^>]*>\s*([^<]{3,100})\s*<',
+                content, re.IGNORECASE
+            )
+            if title_match:
+                title = _clean_text(title_match.group(1))
+            else:
+                # Берём первый длинный текстовый фрагмент
+                texts = re.findall(r'>([^<]{5,80})<', content)
+                title = next((t.strip() for t in texts if len(t.strip()) > 4 and query_lower in t.lower()), text[:60])
+            
+            # Картинка
+            img_match = re.search(r'<img[^>]+src="(https?://[^"]{10,}(?:jpg|jpeg|png|webp)[^"]*)"', content, re.IGNORECASE)
+            image = img_match.group(1) if img_match else None
+            
             lots.append({
-                "title": title_clean,
+                "title": title[:100],
                 "price": price,
-                "url": link,
+                "url": full_url,
                 "image": image,
             })
+            
+            if len(lots) >= 10:
+                break
+        
+        if lots:
+            break
+    
+    return lots
 
-    return lots[:10]
+def _parse_fallback(html: str, query_lower: str) -> list:
+    """Последний резервный парсер — ищет любые ценники рядом с нужными словами."""
+    lots = []
+    
+    # Разбиваем HTML на блоки по 500 символов
+    step = 300
+    window = 600
+    for i in range(0, len(html), step):
+        chunk = html[i:i + window]
+        
+        if query_lower not in chunk.lower():
+            continue
+        
+        # Ищем цену
+        price_match = re.search(r'(\d[\d\s]{1,10}\d)\s*(?:₽|\$)', chunk)
+        if not price_match:
+            continue
+        price = _parse_price(price_match.group(1))
+        if price <= 0 or price > 100_000_000:
+            continue
+        
+        # Ищем ссылку
+        link_match = re.search(r'href="(/[^"?#]{5,})"', chunk)
+        if not link_match:
+            continue
+        href = link_match.group(1)
+        full_url = BASE_URL + href
+        
+        # Заголовок — чистый текст из чанка
+        texts = [t.strip() for t in re.findall(r'>([^<]{4,80})<', chunk) if query_lower in t.lower()]
+        title = texts[0] if texts else query_lower
+        
+        lots.append({
+            "title": _clean_text(title)[:100],
+            "price": price,
+            "url": full_url,
+            "image": None,
+        })
+        
+        if len(lots) >= 5:
+            break
+    
+    return lots
 
 def handler(event: dict, context) -> dict:
     headers = {
@@ -105,12 +298,13 @@ def handler(event: dict, context) -> dict:
     try:
         # Получаем активные позиции вишлиста
         cur.execute(
-            f"SELECT id, name, category, max_price FROM {SCHEMA}.wishlist WHERE active=TRUE"
+            f"SELECT id, name, category, max_price FROM {SCHEMA}.wishlist WHERE active=TRUE ORDER BY id"
         )
         wishlist = cur.fetchall()
 
         for wid, wname, wcategory, wmax_price in wishlist:
             lots = fetch_listings(wname)
+            print(f"[scan] '{wname}' — найдено лотов: {len(lots)}")
 
             for lot in lots:
                 if lot["price"] > wmax_price:
